@@ -1,0 +1,21 @@
+# Output files
+reports/
+*.csv
+*.html
+
+# PowerShell
+*.pssproj
+*.psproj
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# Credentials — never commit
+*.pfx
+*.pem
+*.key
+secrets.json
+appsettings.Local.json
