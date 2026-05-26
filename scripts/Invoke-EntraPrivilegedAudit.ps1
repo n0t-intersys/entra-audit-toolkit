@@ -127,9 +127,21 @@ function Invoke-PrivilegedAudit {
     # ── 1. Active role assignments ────────────────────────────────────────────
     Write-Verbose 'Retrieving active Entra ID role assignments…'
 
+    # Graph only allows one $expand per query — pre-load role definitions into
+    # a lookup table, then expand only 'principal' when fetching assignments.
+    $roleDefMap = @{}
+    try {
+        Get-MgRoleManagementDirectoryRoleDefinition -All -ErrorAction Stop |
+            ForEach-Object { $roleDefMap[$_.Id] = $_.DisplayName }
+        Write-Verbose "  Role definitions loaded: $($roleDefMap.Count)"
+    }
+    catch {
+        Write-Verbose "  Could not pre-load role definitions: $_"
+    }
+
     try {
         $roleAssignments = Get-MgRoleManagementDirectoryRoleAssignment -All `
-            -ExpandProperty 'principal,roleDefinition' -ErrorAction Stop
+            -ExpandProperty 'principal' -ErrorAction Stop
     }
     catch {
         Write-Warning "Could not retrieve role assignments: $_"
@@ -137,7 +149,7 @@ function Invoke-PrivilegedAudit {
     }
 
     foreach ($assignment in $roleAssignments) {
-        $roleName = $assignment.RoleDefinition.DisplayName
+        $roleName  = $roleDefMap[$assignment.RoleDefinitionId] ?? $assignment.RoleDefinitionId
         $principal = $assignment.Principal
 
         if (-not $principal) { continue }
@@ -190,11 +202,11 @@ function Invoke-PrivilegedAudit {
 
     try {
         $eligibleAssignments = Get-MgRoleManagementDirectoryRoleEligibilitySchedule -All `
-            -ExpandProperty 'principal,roleDefinition' -ErrorAction SilentlyContinue
+            -ExpandProperty 'principal' -ErrorAction SilentlyContinue
 
         if ($eligibleAssignments) {
             foreach ($ea in $eligibleAssignments) {
-                $roleName  = $ea.RoleDefinition.DisplayName
+                $roleName  = $roleDefMap[$ea.RoleDefinitionId] ?? $ea.RoleDefinitionId
                 $principal = $ea.Principal
                 if (-not $principal) { continue }
 
