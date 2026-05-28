@@ -1,19 +1,19 @@
-#Requires -Modules Microsoft.Graph.Users, Microsoft.Graph.Identity.DirectoryManagement
+#Requires -Modules Microsoft.Graph.Reports, Microsoft.Graph.Identity.DirectoryManagement
 <#
 .SYNOPSIS
     Audits MFA registration status and authentication method strength across Entra ID users.
 
 .DESCRIPTION
-    Evaluates the authentication method registrations for all users, identifying
-    accounts without MFA, accounts using weak methods (SMS/voice), privileged
-    accounts relying on legacy per-user MFA, and overall tenant MFA posture.
+    Evaluates the authentication method registrations for all users using the bulk
+    registration report API, identifying accounts without MFA, accounts using weak methods
+    (SMS/voice), privileged accounts relying on legacy per-user MFA, and overall tenant
+    MFA posture.
 
     Findings covered:
       - Users with no MFA method registered (password-only authentication)
       - Users with only weak MFA (SMS OTP, voice call)
       - Privileged role holders without strong MFA (FIDO2 or Authenticator app)
-      - Per-user MFA enforcement state (legacy, pre-CA enforcement)
-      - Accounts with SSPR registered but no MFA (SSPR can bypass security controls)
+      - Privileged role holders with moderate-only MFA
 
 .PARAMETER OutputPath
     Directory to write CSV output. Default: .\reports\
@@ -31,13 +31,14 @@
     .\Invoke-EntraMFAAudit.ps1 -SkipGuestUsers:$false -OutputPath C:\EntraReports
 
 .NOTES
-    Required scopes : UserAuthenticationMethod.Read.All, User.Read.All, Directory.Read.All
-    Note            : Reading authentication methods requires UserAuthenticationMethod.Read.All
-                      which is a highly privileged scope — use app-only auth in production.
+    Required scopes : Reports.Read.All, Directory.Read.All
+    Note            : Uses the authentication method registration report (bulk API) —
+                      requires Reports.Read.All which is less privileged than per-user
+                      UserAuthenticationMethod.Read.All.
     Legal           : Run only on tenants you own or have written authorisation to audit.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
     [Parameter()]
     [string]$OutputPath = '.\reports',
@@ -46,34 +47,44 @@ param(
     [bool]$SkipGuestUsers = $true,
 
     [Parameter()]
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # ── App-only (enterprise application) authentication ──────────────────────
+    [Parameter()]
+    [string]$TenantId = '',
+
+    [Parameter()]
+    [string]$ClientId = '',
+
+    [Parameter()]
+    [securestring]$ClientSecret,
+
+    [Parameter()]
+    [string]$CertificateThumbprint = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+Import-Module (Join-Path $PSScriptRoot 'AuditHelpers.psm1') -Force
+
 # ── Method type classification ────────────────────────────────────────────────
+# Keys match the report API's MethodsRegistered string values
 
 $METHOD_STRENGTH = @{
-    '#microsoft.graph.fido2AuthenticationMethod'              = @{ Name='FIDO2 Key';           Strength='Strong' }
-    '#microsoft.graph.microsoftAuthenticatorAuthenticationMethod' = @{ Name='Authenticator App'; Strength='Strong' }
-    '#microsoft.graph.windowsHelloForBusinessAuthenticationMethod' = @{ Name='Windows Hello';    Strength='Strong' }
-    '#microsoft.graph.phoneAuthenticationMethod'              = @{ Name='SMS/Voice';            Strength='Weak' }
-    '#microsoft.graph.emailAuthenticationMethod'              = @{ Name='Email OTP';            Strength='Weak' }
-    '#microsoft.graph.softwareOathAuthenticationMethod'       = @{ Name='TOTP (OATH)';          Strength='Moderate' }
-    '#microsoft.graph.temporaryAccessPassAuthenticationMethod' = @{ Name='Temporary Access Pass'; Strength='Temporary' }
-    '#microsoft.graph.passwordAuthenticationMethod'           = @{ Name='Password';             Strength='None' }
+    'microsoftAuthenticatorPush'          = @{ Name='Authenticator App (Push)';    Strength='Strong' }
+    'microsoftAuthenticatorPasswordless'  = @{ Name='Authenticator Passwordless';  Strength='Strong' }
+    'fido2'                               = @{ Name='FIDO2 Key';                   Strength='Strong' }
+    'windowsHelloForBusiness'             = @{ Name='Windows Hello for Business';  Strength='Strong' }
+    'softwareOneTimePasscode'             = @{ Name='TOTP (Software OATH)';        Strength='Moderate' }
+    'hardwareOneTimePasscode'             = @{ Name='TOTP (Hardware OATH)';        Strength='Moderate' }
+    'sms'                                 = @{ Name='SMS OTP';                     Strength='Weak' }
+    'voice'                               = @{ Name='Voice Call';                  Strength='Weak' }
+    'email'                               = @{ Name='Email OTP';                   Strength='Weak' }
+    'temporaryAccessPass'                 = @{ Name='Temporary Access Pass';       Strength='Temporary' }
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
-
-function Assert-MgConnection {
-    try { if (-not (Get-MgContext -ErrorAction Stop)) { throw } }
-    catch {
-        Write-Error "Not connected. Run: Connect-MgGraph -Scopes 'UserAuthenticationMethod.Read.All','User.Read.All','Directory.Read.All'"
-        exit 1
-    }
-}
 
 function Write-AuditBanner {
     Write-Host ''
@@ -82,27 +93,6 @@ function Write-AuditBanner {
     Write-Host '  ⚠  Run only on tenants you own or have written authorisation to audit.' -ForegroundColor Yellow
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
     Write-Host ''
-}
-
-function New-Finding {
-    param(
-        [string]$Category,
-        [string]$UserPrincipalName,
-        [string]$DisplayName,
-        [string]$MethodsRegistered,
-        [string]$Detail,
-        [ValidateSet('Critical','High','Medium','Low','Info')]
-        [string]$Severity
-    )
-    [PSCustomObject]@{
-        Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        Severity          = $Severity
-        Category          = $Category
-        UserPrincipalName = $UserPrincipalName
-        DisplayName       = $DisplayName
-        MethodsRegistered = $MethodsRegistered
-        Detail            = $Detail
-    }
 }
 
 # ── Main audit ────────────────────────────────────────────────────────────────
@@ -114,135 +104,105 @@ function Invoke-MFAAudit {
     $findings = [System.Collections.Generic.List[PSCustomObject]]::new()
     $stats    = @{ Total=0; NoMFA=0; WeakOnly=0; Strong=0; Moderate=0 }
 
-    # Get privileged role holders for cross-reference
+    # ── Privileged role members for cross-reference ───────────────────────────
     Write-Verbose 'Retrieving privileged role members for cross-reference…'
     $privUserIds = [System.Collections.Generic.HashSet[string]]::new()
-    try {
-        $privRoles = @(
-            'Global Administrator', 'Privileged Role Administrator',
-            'Security Administrator', 'Exchange Administrator'
-        )
-        foreach ($roleName in $privRoles) {
-            $role = Get-MgDirectoryRole -Filter "displayName eq '$roleName'" -ErrorAction SilentlyContinue
-            if ($role) {
-                $members = Get-MgDirectoryRoleMember -DirectoryRoleId $role.Id -ErrorAction SilentlyContinue
-                foreach ($m in $members) { [void]$privUserIds.Add($m.Id) }
-            }
-        }
-        Write-Verbose "  Privileged users tracked: $($privUserIds.Count)"
+    $privRoleDefIds = @{
+        'Global Administrator'              = '62e90394-69f5-4237-9190-012177145e10'
+        'Privileged Role Administrator'     = '7be44c8a-adaf-4e2a-84d6-ab2649e08a13'
+        'Security Administrator'            = '194ae4cb-b126-40b2-bd5b-6091b380977d'
+        'Exchange Administrator'            = '29232cdf-9323-42fd-ade2-1d097af3e4de'
     }
-    catch { Write-Verbose "Could not retrieve role members: $_" }
-
-    # Get all enabled member users
-    Write-Verbose 'Retrieving enabled users…'
-    $userFilter = "accountEnabled eq true"
-    if ($SkipGuests) { $userFilter += " and userType eq 'Member'" }
-
     try {
-        $users = Get-MgUser -Filter $userFilter -All `
-            -Property 'id','userPrincipalName','displayName','userType' -ErrorAction Stop
+        foreach ($roleId in $privRoleDefIds.Values) {
+            Get-MgRoleManagementDirectoryRoleAssignment -Filter "roleDefinitionId eq '$roleId'" -All -ErrorAction SilentlyContinue |
+                ForEach-Object { [void]$privUserIds.Add($_.PrincipalId) }
+        }
+        Write-Verbose "  Privileged principal IDs tracked: $($privUserIds.Count)"
+    }
+    catch { Write-Verbose "Could not retrieve role assignments: $_" }
+
+    # ── Bulk MFA registration report ──────────────────────────────────────────
+    Write-Verbose 'Retrieving MFA registration report…'
+    try {
+        $regDetails = Get-MgReportAuthenticationMethodUserRegistrationDetail -All -ErrorAction Stop
     }
     catch {
-        Write-Error "Failed to retrieve users: $_"
-        return
+        throw "Failed to retrieve authentication method registration report: $_"
     }
 
-    Write-Verbose "  Processing $($users.Count) user(s)…"
+    Write-Verbose "  Processing $($regDetails.Count) user record(s)…"
     $processed = 0
 
-    foreach ($user in $users) {
+    foreach ($reg in $regDetails) {
+        # Apply guest filter
+        if ($SkipGuests -and $reg.UserType -eq 'guest') { continue }
+
         $stats.Total++
         $processed++
-        if ($processed % 50 -eq 0) {
-            Write-Verbose "  Progress: $processed / $($users.Count)"
-        }
+        if ($processed % 100 -eq 0) { Write-Verbose "  Progress: $processed / $($regDetails.Count)" }
 
-        # Get authentication methods for this user
-        try {
-            $methods = Get-MgUserAuthenticationMethod -UserId $user.Id -ErrorAction SilentlyContinue
-        }
-        catch {
-            Write-Verbose "  Could not read methods for $($user.UserPrincipalName): $_"
-            continue
-        }
+        $upn     = $reg.UserPrincipalName
+        $name    = $reg.UserDisplayName
+        $uType   = $reg.UserType ?? 'member'
+        $isPriv  = $privUserIds.Contains($reg.Id)
 
-        # Classify methods (exclude password-only)
-        $mfaMethods    = $methods | Where-Object { $_.'@odata.type' -ne '#microsoft.graph.passwordAuthenticationMethod' }
-        $methodNames   = $mfaMethods | ForEach-Object {
-            $METHOD_STRENGTH[$_.'@odata.type']?.Name ?? 'Unknown'
-        }
-        $methodSummary = ($methodNames -join ', ') ?: 'None'
+        # Classify registered methods
+        $registeredMethods = $reg.MethodsRegistered | Where-Object { $_ -ne 'password' }
+        $methodNames   = $registeredMethods | ForEach-Object { $METHOD_STRENGTH[$_]?.Name ?? $_ }
+        $methodSummary = if ($methodNames) { $methodNames -join ', ' } else { 'None' }
 
-        $hasStrong   = $mfaMethods | Where-Object { $METHOD_STRENGTH[$_.'@odata.type']?.Strength -eq 'Strong' }
-        $hasWeak     = $mfaMethods | Where-Object { $METHOD_STRENGTH[$_.'@odata.type']?.Strength -eq 'Weak' }
-        $hasModerate = $mfaMethods | Where-Object { $METHOD_STRENGTH[$_.'@odata.type']?.Strength -eq 'Moderate' }
-        $isPriv      = $privUserIds.Contains($user.Id)
+        $hasStrong   = $registeredMethods | Where-Object { $METHOD_STRENGTH[$_]?.Strength -eq 'Strong' }
+        $hasWeak     = $registeredMethods | Where-Object { $METHOD_STRENGTH[$_]?.Strength -eq 'Weak' }
+        $hasModerate = $registeredMethods | Where-Object { $METHOD_STRENGTH[$_]?.Strength -eq 'Moderate' }
 
         # ── No MFA registered ─────────────────────────────────────────────────
-        if ($mfaMethods.Count -eq 0) {
+        if (-not $registeredMethods) {
             $stats.NoMFA++
             $sev = if ($isPriv) { 'Critical' } else { 'High' }
-            $findings.Add((New-Finding -Category 'NoMFARegistered' `
-                -UserPrincipalName $user.UserPrincipalName -DisplayName $user.DisplayName `
-                -MethodsRegistered 'None' -Severity $sev `
-                -Detail "No MFA method registered$(if($isPriv){' [PRIVILEGED ACCOUNT]'}) — account protected by password only"))
+            $findings.Add((New-AuditFinding -Module 'MFAAudit' -Category 'NoMFARegistered' `
+                -Identity $upn -IdentityType $uType -Resource 'Authentication Methods' `
+                -Severity $sev `
+                -Detail "No MFA method registered$(if($isPriv){' [PRIVILEGED ACCOUNT]'}) — account protected by password only" `
+                -Recommendation 'Require MFA registration via Conditional Access; consider Authenticator App or FIDO2'))
         }
         # ── Weak MFA only ─────────────────────────────────────────────────────
         elseif ($hasWeak -and -not $hasStrong -and -not $hasModerate) {
             $stats.WeakOnly++
             $sev = if ($isPriv) { 'High' } else { 'Medium' }
-            $findings.Add((New-Finding -Category 'WeakMFAOnly' `
-                -UserPrincipalName $user.UserPrincipalName -DisplayName $user.DisplayName `
-                -MethodsRegistered $methodSummary -Severity $sev `
-                -Detail "Only weak MFA registered: $methodSummary$(if($isPriv){' [PRIVILEGED ACCOUNT]'}) — SMS/voice OTP is vulnerable to SIM-swapping and SS7 attacks"))
+            $findings.Add((New-AuditFinding -Module 'MFAAudit' -Category 'WeakMFAOnly' `
+                -Identity $upn -IdentityType $uType -Resource $methodSummary `
+                -Severity $sev `
+                -Detail "Only weak MFA registered: $methodSummary$(if($isPriv){' [PRIVILEGED ACCOUNT]'}) — SMS/voice is vulnerable to SIM-swapping and SS7 attacks" `
+                -Recommendation 'Encourage users to register Authenticator App; block SMS for privileged accounts'))
         }
         # ── Privileged user without strong MFA ────────────────────────────────
         elseif ($isPriv -and -not $hasStrong) {
-            $findings.Add((New-Finding -Category 'PrivilegedWeakMFA' `
-                -UserPrincipalName $user.UserPrincipalName -DisplayName $user.DisplayName `
-                -MethodsRegistered $methodSummary -Severity 'High' `
-                -Detail "Privileged account without FIDO2 or Authenticator app — moderate/weak MFA insufficient for admin roles; recommend phishing-resistant MFA"))
+            $findings.Add((New-AuditFinding -Module 'MFAAudit' -Category 'PrivilegedWeakMFA' `
+                -Identity $upn -IdentityType $uType -Resource $methodSummary `
+                -Severity 'High' `
+                -Detail "Privileged account using $methodSummary — phishing-resistant MFA (FIDO2 or Authenticator) required for admin roles" `
+                -Recommendation 'Enforce phishing-resistant MFA for privileged roles via Conditional Access authentication strength policy'))
         }
-        elseif ($hasStrong) { $stats.Strong++ }
+        elseif ($hasStrong)   { $stats.Strong++ }
         elseif ($hasModerate) { $stats.Moderate++ }
     }
 
-    # Summary stats line
+    # ── Coverage summary ──────────────────────────────────────────────────────
     Write-Host "  MFA Coverage:" -ForegroundColor White
-    Write-Host ("    No MFA registered : {0} users ({1:P0})" -f $stats.NoMFA, ($stats.NoMFA / [Math]::Max(1,$stats.Total))) -ForegroundColor $(if($stats.NoMFA -gt 0){'Red'}else{'Green'})
-    Write-Host ("    Weak MFA only     : {0} users" -f $stats.WeakOnly) -ForegroundColor $(if($stats.WeakOnly -gt 0){'DarkYellow'}else{'Green'})
-    Write-Host ("    Strong MFA        : {0} users" -f $stats.Strong) -ForegroundColor Green
+    Write-Host ("    No MFA registered : {0} users ({1:P0})" -f $stats.NoMFA,   ($stats.NoMFA   / [Math]::Max(1,$stats.Total))) -ForegroundColor $(if($stats.NoMFA -gt 0){'Red'}else{'Green'})
+    Write-Host ("    Weak MFA only     : {0} users ({1:P0})" -f $stats.WeakOnly, ($stats.WeakOnly / [Math]::Max(1,$stats.Total))) -ForegroundColor $(if($stats.WeakOnly -gt 0){'DarkYellow'}else{'Green'})
+    Write-Host ("    Moderate MFA      : {0} users ({1:P0})" -f $stats.Moderate, ($stats.Moderate / [Math]::Max(1,$stats.Total))) -ForegroundColor Cyan
+    Write-Host ("    Strong MFA        : {0} users ({1:P0})" -f $stats.Strong,   ($stats.Strong  / [Math]::Max(1,$stats.Total))) -ForegroundColor Green
     Write-Host ''
 
     return $findings
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-function Write-AuditSummary {
-    param([System.Collections.Generic.List[PSCustomObject]]$Findings)
-
-    $severityOrder = @{ Critical=0; High=1; Medium=2; Low=3; Info=4 }
-    $colorMap      = @{ Critical='Red'; High='DarkYellow'; Medium='Yellow'; Low='Cyan'; Info='Gray' }
-
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-    Write-Host '  FINDINGS SUMMARY' -ForegroundColor White
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-
-    $Findings | Group-Object Severity | Sort-Object { $severityOrder[$_.Name] } |
-        ForEach-Object {
-            $icon = switch ($_.Name) {
-                'Critical' { '🔴' }; 'High' { '🟠' }; 'Medium' { '🟡' };
-                'Low' { '🔵' }; default { '⚪' }
-            }
-            Write-Host ("  $icon {0,-10} {1,4}" -f $_.Name, $_.Count) -ForegroundColor $colorMap[$_.Name]
-        }
-    Write-Host ''
-}
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-Assert-MgConnection
+Assert-MgConnection -RequiredScopes 'Reports.Read.All','Directory.Read.All' `
+    -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
 Write-AuditBanner
 
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }

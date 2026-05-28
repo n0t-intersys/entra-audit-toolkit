@@ -36,7 +36,7 @@
     Legal           : Run only on tenants you own or have written authorisation to audit.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
     [Parameter()]
     [string]$OutputPath = '.\reports',
@@ -46,11 +46,26 @@ param(
     [int]$CredentialExpiryWarningDays = 30,
 
     [Parameter()]
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # ── App-only (enterprise application) authentication ──────────────────────
+    [Parameter()]
+    [string]$TenantId = '',
+
+    [Parameter()]
+    [string]$ClientId = '',
+
+    [Parameter()]
+    [securestring]$ClientSecret,
+
+    [Parameter()]
+    [string]$CertificateThumbprint = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'AuditHelpers.psm1') -Force
 
 # ── High-risk Graph API permissions ──────────────────────────────────────────
 # Application (non-delegated) permissions that warrant escalated review
@@ -70,14 +85,6 @@ $HIGH_RISK_APP_PERMISSIONS = @{
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-function Assert-MgConnection {
-    try { if (-not (Get-MgContext -ErrorAction Stop)) { throw } }
-    catch {
-        Write-Error "Not connected. Run: Connect-MgGraph -Scopes 'Application.Read.All','Directory.Read.All'"
-        exit 1
-    }
-}
-
 function Write-AuditBanner {
     Write-Host ''
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
@@ -86,25 +93,6 @@ function Write-AuditBanner {
     Write-Host '  ⚠  Run only on tenants you own or have written authorisation to audit.' -ForegroundColor Yellow
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
     Write-Host ''
-}
-
-function New-Finding {
-    param(
-        [string]$Category,
-        [string]$AppName,
-        [string]$AppId,
-        [string]$Detail,
-        [ValidateSet('Critical','High','Medium','Low','Info')]
-        [string]$Severity
-    )
-    [PSCustomObject]@{
-        Timestamp = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        Severity  = $Severity
-        Category  = $Category
-        AppName   = $AppName
-        AppId     = $AppId
-        Detail    = $Detail
-    }
 }
 
 # ── Main audit ────────────────────────────────────────────────────────────────
@@ -121,7 +109,7 @@ function Invoke-AppAudit {
     Write-Verbose 'Retrieving app registrations…'
     try {
         $apps = Get-MgApplication -All -Property @(
-            'id','appId','displayName','signInAudience','owners',
+            'id','appId','displayName','signInAudience',
             'passwordCredentials','keyCredentials','requiredResourceAccess',
             'createdDateTime'
         ) -ErrorAction Stop
@@ -144,14 +132,18 @@ function Invoke-AppAudit {
             $daysLeft = [int]($expiry - $now).TotalDays
 
             if ($expiry -lt $now) {
-                $findings.Add((New-Finding -Category 'ExpiredSecret' -AppName $name -AppId $appId `
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExpiredSecret' `
+                    -Identity $name -IdentityType 'application' -Resource $appId `
                     -Severity 'High' `
-                    -Detail "Client secret '$($cred.DisplayName ?? $cred.KeyId)' expired $([math]::Abs($daysLeft)) days ago — app may be broken or using an alternate auth method"))
+                    -Detail "Client secret '$($cred.DisplayName ?? $cred.KeyId)' expired $([math]::Abs($daysLeft)) days ago — app may be broken or using an alternate auth method" `
+                    -Recommendation 'Rotate the secret immediately; audit whether the app is still in use'))
             }
             elseif ($expiry -lt $warnDate) {
-                $findings.Add((New-Finding -Category 'ExpiringSecret' -AppName $name -AppId $appId `
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExpiringSecret' `
+                    -Identity $name -IdentityType 'application' -Resource $appId `
                     -Severity 'Medium' `
-                    -Detail "Client secret expires in $daysLeft days ($($expiry.ToString('yyyy-MM-dd'))) — rotate before expiry to avoid outage"))
+                    -Detail "Client secret expires in $daysLeft days ($($expiry.ToString('yyyy-MM-dd'))) — rotate before expiry to avoid outage" `
+                    -Recommendation 'Rotate the secret and update all consumers; consider certificate-based auth instead'))
             }
         }
 
@@ -162,29 +154,43 @@ function Invoke-AppAudit {
             $daysLeft = [int]($expiry - $now).TotalDays
 
             if ($expiry -lt $now) {
-                $findings.Add((New-Finding -Category 'ExpiredCertificate' -AppName $name -AppId $appId `
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExpiredCertificate' `
+                    -Identity $name -IdentityType 'application' -Resource $appId `
                     -Severity 'High' `
-                    -Detail "Certificate '$($cert.DisplayName ?? $cert.KeyId)' expired $([math]::Abs($daysLeft)) days ago"))
+                    -Detail "Certificate '$($cert.DisplayName ?? $cert.KeyId)' expired $([math]::Abs($daysLeft)) days ago" `
+                    -Recommendation 'Replace the certificate immediately and update the application configuration'))
             }
             elseif ($expiry -lt $warnDate) {
-                $findings.Add((New-Finding -Category 'ExpiringCertificate' -AppName $name -AppId $appId `
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExpiringCertificate' `
+                    -Identity $name -IdentityType 'application' -Resource $appId `
                     -Severity 'Medium' `
-                    -Detail "Certificate expires in $daysLeft days ($($expiry.ToString('yyyy-MM-dd')))"))
+                    -Detail "Certificate expires in $daysLeft days ($($expiry.ToString('yyyy-MM-dd')))" `
+                    -Recommendation 'Renew the certificate before expiry and update the application configuration'))
             }
         }
 
         # ── No owners ────────────────────────────────────────────────────────
-        if ($app.Owners.Count -eq 0) {
-            $findings.Add((New-Finding -Category 'NoOwner' -AppName $name -AppId $appId `
+        try {
+            $owners = Get-MgApplicationOwner -ApplicationId $app.Id -ErrorAction Stop
+        } catch {
+            $owners = @()
+            Write-Verbose "  Could not retrieve owners for $name : $_"
+        }
+        if ($owners.Count -eq 0) {
+            $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'NoOwner' `
+                -Identity $name -IdentityType 'application' -Resource $appId `
                 -Severity 'Medium' `
-                -Detail 'App registration has no owner — orphaned apps have no accountable party for access review or incident response'))
+                -Detail 'App registration has no owner — orphaned apps have no accountable party for access review or incident response' `
+                -Recommendation 'Assign at least one owner; consider using a group rather than an individual'))
         }
 
         # ── Multi-tenant exposure ─────────────────────────────────────────────
         if ($app.SignInAudience -in 'AzureADMultipleOrgs', 'AzureADandPersonalMicrosoftAccount') {
-            $findings.Add((New-Finding -Category 'MultiTenantApp' -AppName $name -AppId $appId `
+            $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'MultiTenantApp' `
+                -Identity $name -IdentityType 'application' -Resource $appId `
                 -Severity 'Medium' `
-                -Detail "App is multi-tenant (SignInAudience: $($app.SignInAudience)) — users from external tenants can authenticate; verify this is intentional"))
+                -Detail "App is multi-tenant (SignInAudience: $($app.SignInAudience)) — users from external tenants can authenticate; verify this is intentional" `
+                -Recommendation 'Restrict to single-tenant unless cross-tenant access is a documented requirement; review consent settings'))
         }
 
         # ── High-privilege application permissions ────────────────────────────
@@ -193,9 +199,11 @@ function Invoke-AppAudit {
                 if ($scope.Type -ne 'Role') { continue }  # Role = Application permission (non-delegated)
                 $permInfo = $HIGH_RISK_APP_PERMISSIONS[$scope.Id]
                 if ($permInfo) {
-                    $findings.Add((New-Finding -Category 'HighPrivilegeAppPermission' -AppName $name -AppId $appId `
+                    $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'HighPrivilegeAppPermission' `
+                        -Identity $name -IdentityType 'application' -Resource $permInfo.Name `
                         -Severity $permInfo.Risk `
-                        -Detail "Has APPLICATION permission '$($permInfo.Name)' — non-delegated; acts as itself with no user context (T1528)"))
+                        -Detail "Has APPLICATION permission '$($permInfo.Name)' — non-delegated; acts as itself with no user context (T1528)" `
+                        -Recommendation 'Verify this permission is still required; prefer delegated permissions and least-privilege alternatives'))
                 }
             }
         }
@@ -232,54 +240,54 @@ function Invoke-AppAudit {
             $daysLeft = [int]($expiry - $now).TotalDays
             if ($expiry -lt $warnDate) {
                 $sev = if ($expiry -lt $now) { 'High' } else { 'Medium' }
-                $findings.Add((New-Finding -Category 'ExpiringServicePrincipalCred' -AppName $name -AppId $appId `
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExpiringServicePrincipalCred' `
+                    -Identity $name -IdentityType 'servicePrincipal' -Resource $appId `
                     -Severity $sev `
-                    -Detail "Service principal secret $(if($expiry -lt $now){"expired $([math]::Abs($daysLeft)) days ago"}else{"expires in $daysLeft days"})"))
+                    -Detail "Service principal secret $(if($expiry -lt $now){"expired $([math]::Abs($daysLeft)) days ago"}else{"expires in $daysLeft days"})" `
+                    -Recommendation 'Rotate the credential; consider managed identity to eliminate secret management'))
             }
         }
 
         # ── External (non-home-tenant) service principals ─────────────────────
         if ($sp.AppOwnerOrganizationId -and $sp.AppOwnerOrganizationId -ne $tenantId) {
-            $findings.Add((New-Finding -Category 'ExternalServicePrincipal' -AppName $name -AppId $appId `
+            $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'ExternalServicePrincipal' `
+                -Identity $name -IdentityType 'servicePrincipal' -Resource $appId `
                 -Severity 'Info' `
-                -Detail "Service principal from external tenant ($($sp.AppOwnerOrganizationId)) — verify consent is intentional and permissions are scoped appropriately"))
+                -Detail "Service principal from external tenant ($($sp.AppOwnerOrganizationId)) — verify consent is intentional and permissions are scoped appropriately" `
+                -Recommendation 'Review the consented permissions; revoke consent if the integration is no longer required'))
+        }
+    }
+
+    # ── Granted application permissions (admin-consented) ─────────────────────
+    Write-Verbose 'Checking granted application permissions (app role assignments)…'
+    foreach ($sp in $sps) {
+        if ($sp.AppOwnerOrganizationId -eq '72f988bf-86f1-41af-91ab-2d7cd011db47') { continue }
+        if ($sp.ServicePrincipalType -eq 'ManagedIdentity') { continue }
+        try {
+            $appRoleAssignments = Get-MgServicePrincipalAppRoleAssignment -ServicePrincipalId $sp.Id -ErrorAction Stop
+        } catch {
+            Write-Verbose "  Could not get app role assignments for $($sp.DisplayName): $_"
+            continue
+        }
+        foreach ($assignment in $appRoleAssignments) {
+            $permInfo = $HIGH_RISK_APP_PERMISSIONS[$assignment.AppRoleId]
+            if ($permInfo) {
+                $findings.Add((New-AuditFinding -Module 'AppAudit' -Category 'GrantedHighPrivilegePermission' `
+                    -Identity $sp.DisplayName -IdentityType 'servicePrincipal' -Resource $permInfo.Name `
+                    -Severity $permInfo.Risk `
+                    -Detail "Admin-consented APPLICATION permission '$($permInfo.Name)' ($($permInfo.Risk)) — this permission has been granted and is active" `
+                    -Recommendation "Verify this permission is still required; consider reducing to least-privilege alternative"))
+            }
         }
     }
 
     return $findings
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-function Write-AuditSummary {
-    param([System.Collections.Generic.List[PSCustomObject]]$Findings)
-
-    $severityOrder = @{ Critical=0; High=1; Medium=2; Low=3; Info=4 }
-    $colorMap      = @{ Critical='Red'; High='DarkYellow'; Medium='Yellow'; Low='Cyan'; Info='Gray' }
-
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-    Write-Host '  FINDINGS SUMMARY' -ForegroundColor White
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-
-    $Findings | Group-Object Category | ForEach-Object {
-        Write-Host ("  {0,-35} {1,4} finding(s)" -f $_.Name, $_.Count) -ForegroundColor White
-    }
-    Write-Host ''
-
-    $Findings | Group-Object Severity | Sort-Object { $severityOrder[$_.Name] } |
-        ForEach-Object {
-            $icon = switch ($_.Name) {
-                'Critical' { '🔴' }; 'High' { '🟠' }; 'Medium' { '🟡' };
-                'Low' { '🔵' }; default { '⚪' }
-            }
-            Write-Host ("  $icon {0,-10} {1,4}" -f $_.Name, $_.Count) -ForegroundColor $colorMap[$_.Name]
-        }
-    Write-Host ''
-}
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-Assert-MgConnection
+Assert-MgConnection -RequiredScopes 'Application.Read.All','Directory.Read.All' `
+    -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
 Write-AuditBanner
 
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
@@ -290,7 +298,7 @@ if ($findings.Count -eq 0) {
     Write-Host '  ✅ No application security findings.' -ForegroundColor Green
 }
 else {
-    Write-AuditSummary -Findings $findings
+    Write-AuditSummary -Findings $findings -ShowCategoryBreakdown
     $csv = Join-Path $OutputPath "EntraAppAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     $findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     Write-Host "  📄 Report saved: $csv" -ForegroundColor Green

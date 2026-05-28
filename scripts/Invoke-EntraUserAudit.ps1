@@ -38,7 +38,7 @@
     Legal           : Run only on tenants you own or have written authorisation to audit.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
     [Parameter()]
     [ValidateRange(1, 3650)]
@@ -51,28 +51,28 @@ param(
     [switch]$IncludeGuests,
 
     [Parameter()]
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # ── App-only (enterprise application) authentication ──────────────────────
+    [Parameter()]
+    [string]$TenantId = '',
+
+    [Parameter()]
+    [string]$ClientId = '',
+
+    [Parameter()]
+    [securestring]$ClientSecret,
+
+    [Parameter()]
+    [string]$CertificateThumbprint = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Auth check ────────────────────────────────────────────────────────────────
+Import-Module (Join-Path $PSScriptRoot 'AuditHelpers.psm1') -Force
 
-function Assert-MgConnection {
-    try {
-        $ctx = Get-MgContext -ErrorAction Stop
-        if (-not $ctx) { throw }
-        Write-Verbose "Connected as: $($ctx.Account) | Scopes: $($ctx.Scopes -join ', ')"
-    }
-    catch {
-        Write-Error @"
-Not connected to Microsoft Graph. Run:
-  Connect-MgGraph -Scopes "User.Read.All","AuditLog.Read.All","Directory.Read.All"
-"@
-        exit 1
-    }
-}
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 function Write-AuditBanner {
     $tenant = (Get-MgContext).TenantId
@@ -83,27 +83,6 @@ function Write-AuditBanner {
     Write-Host '  ⚠  Run only on tenants you own or have written authorisation to audit.' -ForegroundColor Yellow
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
     Write-Host ''
-}
-
-function New-Finding {
-    param(
-        [string]$Category,
-        [string]$UserPrincipalName,
-        [string]$DisplayName,
-        [string]$UserType,
-        [string]$Detail,
-        [ValidateSet('Critical','High','Medium','Low','Info')]
-        [string]$Severity
-    )
-    [PSCustomObject]@{
-        Timestamp         = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        Severity          = $Severity
-        Category          = $Category
-        UserPrincipalName = $UserPrincipalName
-        DisplayName       = $DisplayName
-        UserType          = $UserType
-        Detail            = $Detail
-    }
 }
 
 # ── Main audit ────────────────────────────────────────────────────────────────
@@ -147,10 +126,11 @@ function Invoke-UserAudit {
         $lastSignIn = $user.SignInActivity?.LastSignInDateTime
         if ($user.AccountEnabled -and -not $lastSignIn) {
             $ageDays = [int]((Get-Date) - [datetime]$user.CreatedDateTime).TotalDays
-            $findings.Add((New-Finding -Category 'NeverSignedIn' `
-                -UserPrincipalName $upn -DisplayName $name -UserType $uType `
+            $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'NeverSignedIn' `
+                -Identity $upn -IdentityType $uType -Resource '' `
                 -Severity 'Medium' `
-                -Detail "Account enabled but never signed in — created $ageDays days ago"))
+                -Detail "Account enabled but never signed in — created $ageDays days ago" `
+                -Recommendation 'Verify the account is still needed; disable or delete if unused'))
         }
 
         # ── Stale sign-in ─────────────────────────────────────────────────────
@@ -163,45 +143,50 @@ function Invoke-UserAudit {
                     # Guests flagged separately below
                 }
                 else {
-                    $findings.Add((New-Finding -Category 'StaleAccount' `
-                        -UserPrincipalName $upn -DisplayName $name -UserType $uType `
+                    $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'StaleAccount' `
+                        -Identity $upn -IdentityType $uType -Resource '' `
                         -Severity $sev `
-                        -Detail "No sign-in for $daysStale days (threshold: $StaleThresholdDays)"))
+                        -Detail "No sign-in for $daysStale days (threshold: $StaleThresholdDays)" `
+                        -Recommendation 'Verify account is still required; consider disabling or deleting after manager review'))
                 }
             }
         }
 
         # ── Disabled account with licenses ────────────────────────────────────
         if (-not $user.AccountEnabled -and $user.AssignedLicenses.Count -gt 0) {
-            $findings.Add((New-Finding -Category 'DisabledWithLicense' `
-                -UserPrincipalName $upn -DisplayName $name -UserType $uType `
+            $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'DisabledWithLicense' `
+                -Identity $upn -IdentityType $uType -Resource '' `
                 -Severity 'Medium' `
-                -Detail "Disabled account holds $($user.AssignedLicenses.Count) license(s) — licensing cost with no security value"))
+                -Detail "Disabled account holds $($user.AssignedLicenses.Count) license(s) — licensing cost with no security value" `
+                -Recommendation 'Remove licenses from disabled accounts to reclaim spend; automate via lifecycle workflow'))
         }
 
         # ── Guest user checks ─────────────────────────────────────────────────
         if ($isGuest) {
-            $findings.Add((New-Finding -Category 'GuestUser' `
-                -UserPrincipalName $upn -DisplayName $name -UserType 'Guest' `
+            $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'GuestUser' `
+                -Identity $upn -IdentityType 'Guest' -Resource '' `
                 -Severity 'Info' `
-                -Detail "External/B2B guest account — verify access is still required and scoped appropriately"))
+                -Detail "External/B2B guest account — verify access is still required and scoped appropriately" `
+                -Recommendation 'Implement guest access reviews; enforce Entitlement Management access packages with expiry'))
 
             # Stale guest (separate from member stale)
             if ($lastSignIn -and [datetime]$lastSignIn -lt $staleDate) {
                 $daysStale = [int]((Get-Date) - [datetime]$lastSignIn).TotalDays
-                $findings.Add((New-Finding -Category 'StaleGuest' `
-                    -UserPrincipalName $upn -DisplayName $name -UserType 'Guest' `
+                $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'StaleGuest' `
+                    -Identity $upn -IdentityType 'Guest' -Resource '' `
                     -Severity 'High' `
-                    -Detail "Guest account with no sign-in for $daysStale days — external access should be time-limited"))
+                    -Detail "Guest account with no sign-in for $daysStale days — external access should be time-limited" `
+                    -Recommendation 'Remove or expire guest account; use access package expiry to automate time-limited external access'))
             }
         }
 
         # ── No manager (cloud-only accounts) ─────────────────────────────────
         if ($user.AccountEnabled -and $isCloud -and -not $isGuest -and -not $user.Manager) {
-            $findings.Add((New-Finding -Category 'NoManager' `
-                -UserPrincipalName $upn -DisplayName $name -UserType $uType `
+            $findings.Add((New-AuditFinding -Module 'UserAudit' -Category 'NoManager' `
+                -Identity $upn -IdentityType $uType -Resource '' `
                 -Severity 'Low' `
-                -Detail 'No manager attribute set — orphaned accounts evade access certification'))
+                -Detail 'No manager attribute set — orphaned accounts evade access certification' `
+                -Recommendation 'Set manager attribute; use access reviews requiring manager approval to surface unmanaged accounts'))
         }
     }
 
@@ -209,37 +194,10 @@ function Invoke-UserAudit {
     return $findings
 }
 
-# ── Output ────────────────────────────────────────────────────────────────────
-
-function Write-AuditSummary {
-    param([System.Collections.Generic.List[PSCustomObject]]$Findings)
-
-    $severityOrder = @{ Critical=0; High=1; Medium=2; Low=3; Info=4 }
-    $colorMap      = @{ Critical='Red'; High='DarkYellow'; Medium='Yellow'; Low='Cyan'; Info='Gray' }
-
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-    Write-Host '  FINDINGS SUMMARY' -ForegroundColor White
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-
-    $Findings | Group-Object Category | ForEach-Object {
-        Write-Host ("  {0,-30} {1,4} finding(s)" -f $_.Name, $_.Count) -ForegroundColor White
-    }
-    Write-Host ''
-
-    $Findings | Group-Object Severity | Sort-Object { $severityOrder[$_.Name] } |
-        ForEach-Object {
-            $icon = switch ($_.Name) {
-                'Critical' { '🔴' }; 'High' { '🟠' }; 'Medium' { '🟡' };
-                'Low' { '🔵' }; default { '⚪' }
-            }
-            Write-Host ("  $icon {0,-10} {1,4}" -f $_.Name, $_.Count) -ForegroundColor $colorMap[$_.Name]
-        }
-    Write-Host ''
-}
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-Assert-MgConnection
+Assert-MgConnection -RequiredScopes 'User.Read.All','AuditLog.Read.All','Directory.Read.All' `
+    -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
 Write-AuditBanner
 
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
@@ -250,7 +208,7 @@ if ($findings.Count -eq 0) {
     Write-Host '  ✅ No user account findings.' -ForegroundColor Green
 }
 else {
-    Write-AuditSummary -Findings $findings
+    Write-AuditSummary -Findings $findings -ShowCategoryBreakdown
     $csv = Join-Path $OutputPath "EntraUserAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     $findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     Write-Host "  📄 Report saved: $csv" -ForegroundColor Green

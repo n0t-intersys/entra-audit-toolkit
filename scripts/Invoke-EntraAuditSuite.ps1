@@ -48,7 +48,7 @@
     Legal: Run only on tenants you own or have written authorisation to audit.
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
     [Parameter()]
     [string]$OutputPath = '.\reports',
@@ -65,24 +65,27 @@ param(
     [int]$CredentialExpiryWarningDays = 30,
 
     [Parameter()]
-    [switch]$OpenReport
+    [switch]$OpenReport,
+
+    # ── App-only (enterprise application) authentication ──────────────────────
+    # The suite connects once; all sub-modules reuse the same session.
+    [Parameter()]
+    [string]$TenantId = '',
+
+    [Parameter()]
+    [string]$ClientId = '',
+
+    [Parameter()]
+    [securestring]$ClientSecret,
+
+    [Parameter()]
+    [string]$CertificateThumbprint = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# ── Validate connection ───────────────────────────────────────────────────────
-
-function Assert-MgConnection {
-    try { if (-not (Get-MgContext -ErrorAction Stop)) { throw } }
-    catch {
-        Write-Error @"
-Not connected to Microsoft Graph. Run:
-  Connect-MgGraph -Scopes "UserAuthenticationMethod.Read.All","User.Read.All","AuditLog.Read.All","Directory.Read.All","Policy.Read.All","Application.Read.All","RoleManagement.Read.Directory"
-"@
-        exit 1
-    }
-}
+Import-Module (Join-Path $PSScriptRoot 'AuditHelpers.psm1') -Force
 
 # ── Banner ────────────────────────────────────────────────────────────────────
 
@@ -138,6 +141,8 @@ function ConvertTo-HtmlReport {
         [datetime]$RunTime
     )
 
+    Add-Type -AssemblyName System.Web
+
     $severityOrder = @{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
     $severityColor = @{
         Critical = '#ff4444'
@@ -171,21 +176,24 @@ function ConvertTo-HtmlReport {
     # Build findings rows
     $rows = ''
     foreach ($f in ($AllFindings | Sort-Object { $severityOrder[$_.Severity] })) {
-        $col  = $severityColor[$f.Severity]
-        $bg   = $severityBg[$f.Severity]
+        $col    = $severityColor[$f.Severity]
+        $bg     = $severityBg[$f.Severity]
         $detail = [System.Web.HttpUtility]::HtmlEncode($f.Detail ?? '')
         $cat    = [System.Web.HttpUtility]::HtmlEncode($f.Category ?? '')
+        $mod    = [System.Web.HttpUtility]::HtmlEncode($f.Module ?? '')
+        $rec    = [System.Web.HttpUtility]::HtmlEncode($f.Recommendation ?? '')
 
-        # Dynamic columns — pick whichever identity field exists
-        $identity = $f.UserPrincipalName ?? $f.Principal ?? $f.AppName ?? $f.PolicyName ?? '—'
-        $identity = [System.Web.HttpUtility]::HtmlEncode($identity)
+        # Unified identity field
+        $identity = [System.Web.HttpUtility]::HtmlEncode($f.Identity ?? '—')
 
         $rows += @"
     <tr style="background:$bg">
       <td><span class="badge" style="color:$col;border-color:$col">$($f.Severity)</span></td>
+      <td style="font-size:0.85em;color:#8b949e">$mod</td>
       <td>$cat</td>
       <td style="font-family:monospace;font-size:0.85em">$identity</td>
       <td>$detail</td>
+      <td style="font-size:0.85em;color:#8b949e">$rec</td>
     </tr>
 "@
     }
@@ -196,8 +204,6 @@ function ConvertTo-HtmlReport {
         ForEach-Object {
             $catRows += "<tr><td>$($_.Name)</td><td style='text-align:right;font-weight:600'>$($_.Count)</td></tr>"
         }
-
-    Add-Type -AssemblyName System.Web
 
     $html = @"
 <!DOCTYPE html>
@@ -213,7 +219,7 @@ function ConvertTo-HtmlReport {
     header { background: #161b22; border-bottom: 1px solid #30363d; padding: 24px 32px; }
     header h1 { color: #00ff9d; font-size: 1.4em; letter-spacing: 0.05em; text-transform: uppercase; }
     header p  { color: #8b949e; margin-top: 4px; font-size: 0.9em; }
-    main { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+    main { padding: 24px 32px; max-width: 1600px; margin: 0 auto; }
     h2 { color: #00ff9d; font-size: 1em; text-transform: uppercase; letter-spacing: 0.08em;
          margin: 28px 0 12px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
     .cards { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
@@ -255,9 +261,11 @@ $cards  </div>
   <table>
     <tr>
       <th>Severity</th>
+      <th>Module</th>
       <th>Category</th>
       <th>Principal / Resource</th>
       <th>Detail</th>
+      <th>Recommendation</th>
     </tr>
 $rows
   </table>
@@ -273,7 +281,8 @@ $rows
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-Assert-MgConnection
+Assert-MgConnection -RequiredScopes 'User.Read.All','AuditLog.Read.All','Directory.Read.All','Policy.Read.All','Application.Read.All','RoleManagement.Read.Directory','PrivilegedAccess.Read.AzureAD','Reports.Read.All' `
+    -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
 Write-SuiteBanner
 
 $ctx     = Get-MgContext
@@ -348,24 +357,9 @@ catch {
 
 # ── Console summary ───────────────────────────────────────────────────────────
 
-$severityOrder = @{ Critical = 0; High = 1; Medium = 2; Low = 3; Info = 4 }
-$colorMap      = @{ Critical = 'Red'; High = 'DarkYellow'; Medium = 'Yellow'; Low = 'Cyan'; Info = 'Gray' }
-
 Write-Host ''
-Write-Host ('─' * 72) -ForegroundColor DarkGray
-Write-Host '  OVERALL FINDINGS' -ForegroundColor White
-Write-Host ('─' * 72) -ForegroundColor DarkGray
+Write-AuditSummary -Findings $all -ShowCategoryBreakdown
 
-$all | Group-Object Severity | Sort-Object { $severityOrder[$_.Name] } |
-    ForEach-Object {
-        $icon = switch ($_.Name) {
-            'Critical' { '🔴' }; 'High' { '🟠' }; 'Medium' { '🟡' };
-            'Low' { '🔵' }; default { '⚪' }
-        }
-        Write-Host ("  $icon {0,-10} {1,4} finding(s)" -f $_.Name, $_.Count) -ForegroundColor $colorMap[$_.Name]
-    }
-
-Write-Host ''
 if ($all.Count -eq 0) {
     Write-Host '  ✅ No findings across all modules.' -ForegroundColor Green
 }

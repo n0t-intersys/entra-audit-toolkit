@@ -29,17 +29,32 @@
     Reference       : Microsoft CA Best Practices, CIS Microsoft 365 Foundations Benchmark
 #>
 
-[CmdletBinding(SupportsShouldProcess)]
+[CmdletBinding()]
 param(
     [Parameter()]
     [string]$OutputPath = '.\reports',
 
     [Parameter()]
-    [switch]$PassThru
+    [switch]$PassThru,
+
+    # ── App-only (enterprise application) authentication ──────────────────────
+    [Parameter()]
+    [string]$TenantId = '',
+
+    [Parameter()]
+    [string]$ClientId = '',
+
+    [Parameter()]
+    [securestring]$ClientSecret,
+
+    [Parameter()]
+    [string]$CertificateThumbprint = ''
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+Import-Module (Join-Path $PSScriptRoot 'AuditHelpers.psm1') -Force
 
 # ── Legacy auth client apps ───────────────────────────────────────────────────
 
@@ -49,14 +64,6 @@ $LEGACY_AUTH_CLIENTS = @(
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-function Assert-MgConnection {
-    try { if (-not (Get-MgContext -ErrorAction Stop)) { throw } }
-    catch {
-        Write-Error "Not connected. Run: Connect-MgGraph -Scopes 'Policy.Read.All','Directory.Read.All'"
-        exit 1
-    }
-}
-
 function Write-AuditBanner {
     Write-Host ''
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
@@ -65,45 +72,6 @@ function Write-AuditBanner {
     Write-Host '  ⚠  Run only on tenants you own or have written authorisation to audit.' -ForegroundColor Yellow
     Write-Host ('═' * 70) -ForegroundColor DarkCyan
     Write-Host ''
-}
-
-function New-Finding {
-    param(
-        [string]$Category,
-        [string]$PolicyName,
-        [string]$PolicyState,
-        [string]$Detail,
-        [string]$Recommendation,
-        [ValidateSet('Critical','High','Medium','Low','Info')]
-        [string]$Severity
-    )
-    [PSCustomObject]@{
-        Timestamp      = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-        Severity       = $Severity
-        Category       = $Category
-        PolicyName     = $PolicyName
-        PolicyState    = $PolicyState
-        Detail         = $Detail
-        Recommendation = $Recommendation
-    }
-}
-
-# ── Analysis helpers ──────────────────────────────────────────────────────────
-
-function Test-PoliciesCoversAllUsers {
-    param($Policies, $RequiredControl)
-    foreach ($p in $Policies) {
-        if ($p.State -ne 'enabled') { continue }
-        $conditions = $p.Conditions
-        $includesAll = $conditions.Users.IncludeUsers -contains 'All'
-        $noExclusions = $conditions.Users.ExcludeUsers.Count -eq 0 -and
-                        $conditions.Users.ExcludeGroups.Count -eq 0
-        if ($includesAll -and $noExclusions) {
-            $controls = $p.GrantControls.BuiltInControls
-            if ($RequiredControl -in $controls) { return $true }
-        }
-    }
-    return $false
 }
 
 function Get-MFAEnforcingPolicies {
@@ -137,7 +105,8 @@ function Invoke-CAudit {
 
     # ── No CA policies at all ─────────────────────────────────────────────────
     if ($policies.Count -eq 0) {
-        $findings.Add((New-Finding -Category 'NoCAPolicies' -PolicyName 'N/A' -PolicyState 'N/A' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'NoCAPolicies' `
+            -Identity 'N/A' -IdentityType 'policy' -Resource 'N/A' `
             -Severity 'Critical' `
             -Detail 'No Conditional Access policies found — every sign-in granted without condition' `
             -Recommendation 'Implement CA policies starting with MFA for all users and block legacy authentication'))
@@ -146,7 +115,8 @@ function Invoke-CAudit {
 
     # ── Report-only policies ──────────────────────────────────────────────────
     foreach ($p in $reportOnlyPolicies) {
-        $findings.Add((New-Finding -Category 'ReportOnlyPolicy' -PolicyName $p.DisplayName -PolicyState 'Report-Only' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'ReportOnlyPolicy' `
+            -Identity $p.DisplayName -IdentityType 'policy' -Resource $p.DisplayName `
             -Severity 'High' `
             -Detail "Policy '$($p.DisplayName)' is in report-only mode — not enforcing any controls" `
             -Recommendation 'Review sign-in logs for impact, then switch to enabled state'))
@@ -154,7 +124,8 @@ function Invoke-CAudit {
 
     # ── Disabled policies ─────────────────────────────────────────────────────
     foreach ($p in $disabledPolicies) {
-        $findings.Add((New-Finding -Category 'DisabledPolicy' -PolicyName $p.DisplayName -PolicyState 'Disabled' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'DisabledPolicy' `
+            -Identity $p.DisplayName -IdentityType 'policy' -Resource $p.DisplayName `
             -Severity 'Info' `
             -Detail "Policy '$($p.DisplayName)' is disabled — may represent a misconfiguration or leftover config" `
             -Recommendation 'Review and either enable, document as intentional, or delete'))
@@ -163,7 +134,8 @@ function Invoke-CAudit {
     # ── No MFA policy covering all users ─────────────────────────────────────
     $mfaPolicies = Get-MFAEnforcingPolicies -Policies $enabledPolicies
     if ($mfaPolicies.Count -eq 0) {
-        $findings.Add((New-Finding -Category 'MFANotEnforced' -PolicyName 'N/A' -PolicyState 'N/A' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'MFANotEnforced' `
+            -Identity 'N/A' -IdentityType 'policy' -Resource 'N/A' `
             -Severity 'Critical' `
             -Detail 'No enabled CA policy enforces MFA for any users — entire tenant authenticates with password only' `
             -Recommendation 'Create a CA policy: All users → All cloud apps → Require MFA (CIS L1 1.1.3)'))
@@ -177,7 +149,8 @@ function Invoke-CAudit {
                 $broadMFAExists = $true
                 $exclCount = $p.Conditions.Users.ExcludeUsers.Count + $p.Conditions.Users.ExcludeGroups.Count
                 if ($exclCount -gt 5) {
-                    $findings.Add((New-Finding -Category 'BroadMFAExclusions' -PolicyName $p.DisplayName -PolicyState 'Enabled' `
+                    $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'BroadMFAExclusions' `
+                        -Identity $p.DisplayName -IdentityType 'policy' -Resource $p.DisplayName `
                         -Severity 'High' `
                         -Detail "MFA policy '$($p.DisplayName)' has $exclCount exclusions — large exclusion lists create gaps attackers can target" `
                         -Recommendation 'Audit all exclusions; move break-glass accounts to a named exclusion group and review quarterly'))
@@ -186,7 +159,8 @@ function Invoke-CAudit {
         }
 
         if (-not $broadMFAExists) {
-            $findings.Add((New-Finding -Category 'MFANotForAllUsers' -PolicyName 'Multiple' -PolicyState 'Enabled' `
+            $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'MFANotForAllUsers' `
+                -Identity 'Multiple' -IdentityType 'policy' -Resource 'Multiple' `
                 -Severity 'High' `
                 -Detail 'MFA policies exist but none covers All Users — gaps in coverage allow password-only authentication' `
                 -Recommendation 'Consolidate into an All Users → Require MFA baseline policy with minimal exclusions'))
@@ -201,7 +175,8 @@ function Invoke-CAudit {
     }
 
     if (-not $legacyBlockPolicy) {
-        $findings.Add((New-Finding -Category 'LegacyAuthNotBlocked' -PolicyName 'N/A' -PolicyState 'N/A' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'LegacyAuthNotBlocked' `
+            -Identity 'N/A' -IdentityType 'policy' -Resource 'N/A' `
             -Severity 'Critical' `
             -Detail 'No policy blocks legacy authentication protocols (IMAP, POP3, SMTP, EAS) — these bypass MFA entirely' `
             -Recommendation 'Create CA policy: All users → Legacy auth clients → Block (CIS L1 1.3.3)'))
@@ -211,7 +186,16 @@ function Invoke-CAudit {
     $adminRoleIds = @(
         '62e90394-69f5-4237-9190-012177145e10',  # Global Administrator
         'e8611ab8-c189-46e8-94e1-60213ab1f814',  # Privileged Authentication Administrator
-        '7be44c8a-adaf-4e2a-84d6-ab2649e08a13'   # Privileged Role Administrator
+        '7be44c8a-adaf-4e2a-84d6-ab2649e08a13',  # Privileged Role Administrator
+        '194ae4cb-b126-40b2-bd5b-6091b380977d',  # Security Administrator
+        '29232cdf-9323-42fd-ade2-1d097af3e4de',  # Exchange Administrator
+        'f28a1f50-f6e7-4571-818b-6a12f2af6b6c',  # SharePoint Administrator
+        '3a2c62db-5318-420d-8d74-23affee5d9d5',  # Intune Administrator
+        'b1be1c3e-b65d-4f19-8427-f6fa0d97feb9',  # Conditional Access Administrator
+        '0964bb5e-9bdb-4d7b-ac29-58e794862a40',  # Authentication Administrator
+        '2b745bdf-0803-4d80-aa65-822c4493daac',  # Hybrid Identity Administrator
+        '9b895d92-2cd3-44c7-9d02-a6ac2d5ea5c3',  # Application Administrator
+        '158c047a-c907-4556-b7ef-446551a6b5f7'   # Cloud Application Administrator
     )
     $adminCoveredByPolicy = $enabledPolicies | Where-Object {
         $rids = $_.Conditions.Users.IncludeRoles
@@ -220,7 +204,8 @@ function Invoke-CAudit {
     }
 
     if (-not $adminCoveredByPolicy) {
-        $findings.Add((New-Finding -Category 'AdminsNotTargeted' -PolicyName 'N/A' -PolicyState 'N/A' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'AdminsNotTargeted' `
+            -Identity 'N/A' -IdentityType 'policy' -Resource 'N/A' `
             -Severity 'High' `
             -Detail 'No CA policy specifically targets administrator roles — admins should have stricter controls than regular users' `
             -Recommendation 'Create a dedicated admin CA policy requiring MFA + compliant device or privileged workstation'))
@@ -232,7 +217,8 @@ function Invoke-CAudit {
     }
 
     if (-not $riskPolicy) {
-        $findings.Add((New-Finding -Category 'NoSignInRiskPolicy' -PolicyName 'N/A' -PolicyState 'N/A' `
+        $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'NoSignInRiskPolicy' `
+            -Identity 'N/A' -IdentityType 'policy' -Resource 'N/A' `
             -Severity 'Medium' `
             -Detail 'No CA policy responds to sign-in risk (requires Entra ID P2) — risky sign-ins proceed without challenge' `
             -Recommendation 'Create risk-based CA policy: Medium/High risk → Require MFA or Block. Requires Entra ID P2 license'))
@@ -243,7 +229,8 @@ function Invoke-CAudit {
         $includesAll     = $p.Conditions.Users.IncludeUsers -contains 'All'
         $excludesGuests  = $p.Conditions.Users.ExcludeGuestsOrExternalUsers -ne $null
         if ($includesAll -and $excludesGuests) {
-            $findings.Add((New-Finding -Category 'GuestsExcludedFromPolicy' -PolicyName $p.DisplayName -PolicyState 'Enabled' `
+            $findings.Add((New-AuditFinding -Module 'ConditionalAccess' -Category 'GuestsExcludedFromPolicy' `
+                -Identity $p.DisplayName -IdentityType 'policy' -Resource $p.DisplayName `
                 -Severity 'Medium' `
                 -Detail "Policy '$($p.DisplayName)' excludes all guests — external users bypass this control" `
                 -Recommendation 'Create a separate CA policy scoped to guest/external users with appropriate controls'))
@@ -253,40 +240,10 @@ function Invoke-CAudit {
     return $findings
 }
 
-# ── Summary ───────────────────────────────────────────────────────────────────
-
-function Write-AuditSummary {
-    param([System.Collections.Generic.List[PSCustomObject]]$Findings)
-
-    $severityOrder = @{ Critical=0; High=1; Medium=2; Low=3; Info=4 }
-    $colorMap      = @{ Critical='Red'; High='DarkYellow'; Medium='Yellow'; Low='Cyan'; Info='Gray' }
-
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-    Write-Host '  FINDINGS SUMMARY' -ForegroundColor White
-    Write-Host ('─' * 70) -ForegroundColor DarkGray
-
-    $Findings | Group-Object Severity | Sort-Object { $severityOrder[$_.Name] } |
-        ForEach-Object {
-            $icon = switch ($_.Name) {
-                'Critical' { '🔴' }; 'High' { '🟠' }; 'Medium' { '🟡' };
-                'Low' { '🔵' }; default { '⚪' }
-            }
-            Write-Host ("  $icon {0,-10} {1,4}" -f $_.Name, $_.Count) -ForegroundColor $colorMap[$_.Name]
-        }
-
-    Write-Host ''
-    foreach ($f in $Findings | Sort-Object { $severityOrder[$_.Severity] } | Select-Object -First 10) {
-        Write-Host ("  [{0}] {1}" -f $f.Severity, $f.Detail.Substring(0, [Math]::Min(90, $f.Detail.Length))) `
-            -ForegroundColor $colorMap[$f.Severity]
-        Write-Host ("        → {0}" -f $f.Recommendation.Substring(0, [Math]::Min(80, $f.Recommendation.Length))) `
-            -ForegroundColor DarkGray
-    }
-    Write-Host ''
-}
-
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-Assert-MgConnection
+Assert-MgConnection -RequiredScopes 'Policy.Read.All','Directory.Read.All' `
+    -TenantId $TenantId -ClientId $ClientId -ClientSecret $ClientSecret -CertificateThumbprint $CertificateThumbprint
 Write-AuditBanner
 
 if (-not (Test-Path $OutputPath)) { New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null }
@@ -297,7 +254,7 @@ if ($findings.Count -eq 0) {
     Write-Host '  ✅ Conditional Access policies meet baseline requirements.' -ForegroundColor Green
 }
 else {
-    Write-AuditSummary -Findings $findings
+    Write-AuditSummary -Findings $findings -ShowTopFindings
     $csv = Join-Path $OutputPath "EntraConditionalAccessAudit_$(Get-Date -Format 'yyyyMMdd_HHmmss').csv"
     $findings | Export-Csv -Path $csv -NoTypeInformation -Encoding UTF8
     Write-Host "  📄 Report saved: $csv" -ForegroundColor Green
